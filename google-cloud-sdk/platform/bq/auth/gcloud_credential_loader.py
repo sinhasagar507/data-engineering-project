@@ -2,7 +2,7 @@
 """Utilities to load Google Auth credentials from gcloud."""
 
 import logging
-import subprocess  # pylint: disable=unused-import
+import subprocess
 from typing import Iterator, List, Optional
 
 from google.oauth2 import credentials as google_oauth2
@@ -21,11 +21,19 @@ def LoadCredential() -> google_oauth2.Credentials:
   logging.info('Loading auth credentials from gcloud')
   access_token = _GetAccessTokenAndPrintOutput()
   refresh_token = _GetRefreshTokenAndPrintOutput()
+  # When the credential type is user credential - determined by whether we can
+  # get a non-empty refresh token - set a fallback quota project ID to be the
+  # resource project ID. When the credential type is e.g. a service account,
+  # don't set any fallback quota project ID.
+  # TODO: b/367686512 - Check for service account by reading gcloud config.
+  fallback_quota_project_id = (
+      bq_flags.PROJECT_ID.value if refresh_token else None
+  )
   return google_oauth2.Credentials(
       token=access_token,
       refresh_token=refresh_token,
       quota_project_id=bq_utils.GetResolvedQuotaProjectID(
-          bq_auth_flags.QUOTA_PROJECT_ID.value, bq_flags.PROJECT_ID.value
+          bq_auth_flags.QUOTA_PROJECT_ID.value, fallback_quota_project_id
       ),
   )
 
@@ -38,11 +46,14 @@ def _GetRefreshTokenAndPrintOutput() -> Optional[str]:
   return _GetTokenFromGcloudAndPrintOtherOutput(['auth', 'print-refresh-token'])
 
 
-def _GetTokenFromGcloudAndPrintOtherOutput(cmd: List[str]) -> Optional[str]:
+def _GetTokenFromGcloudAndPrintOtherOutput(
+    cmd: List[str],
+    stderr: Optional[int] = subprocess.STDOUT,
+) -> Optional[str]:
   """Returns a token or prints other messages from the given gcloud command."""
   try:
     token = None
-    for output in _RunGcloudCommand(cmd):
+    for output in _RunGcloudCommand(cmd, stderr):
       if output and ' ' not in output:
         # Token is a non-empty string of non-space characters.
         token = output
@@ -82,9 +93,10 @@ def _GetTokenFromGcloudAndPrintOtherOutput(cmd: List[str]) -> Optional[str]:
     )
 
 
-def _RunGcloudCommand(cmd: List[str]) -> Iterator[str]:
+def _RunGcloudCommand(
+    cmd: List[str], stderr: Optional[int] = subprocess.STDOUT
+) -> Iterator[str]:
   """Runs the given gcloud command, yields the output, and returns the final status code."""
-  stderr = subprocess.STDOUT  # pylint:disable=unused-variable
   proc = gcloud_runner.run_gcloud_command(cmd, stderr=stderr)
   error_msgs = []
   if proc.stdout:

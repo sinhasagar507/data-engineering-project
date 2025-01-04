@@ -1,13 +1,37 @@
 #!/usr/bin/env python
 """Utility functions for BQ CLI logging."""
 
+import datetime
 import logging
+import os
 import sys
-from typing import Optional, TextIO
+from typing import Optional, TextIO, Union
 
 from absl import flags
 from absl import logging as absl_logging
 from googleapiclient import model
+
+_UNIQUE_SUFFIX: str = ''
+
+
+def GetUniqueSuffix() -> str:
+  global _UNIQUE_SUFFIX
+  if not _UNIQUE_SUFFIX:
+    _UNIQUE_SUFFIX = datetime.datetime.now().strftime('%z_%Y%m%d_%H%M%S.%f')
+  return _UNIQUE_SUFFIX
+
+
+def SaveStringToLogDirectoryIfTest(
+    file_prefix: str, content: Union[str, bytes]
+):
+  """Saves string content to a file in the log directory."""
+  if 'TEST_UNDECLARED_OUTPUTS_DIR' in os.environ:
+    if isinstance(content, bytes):
+      content = content.decode('utf-8')
+    filename = f'{file_prefix}_{GetUniqueSuffix()}.log'
+    path = os.path.join(os.environ['TEST_UNDECLARED_OUTPUTS_DIR'], filename)
+    with open(path, 'w') as f:
+      f.write(content)
 
 
 def _SetLogFile(logfile: TextIO):
@@ -27,6 +51,20 @@ def ConfigurePythonLogger(apilog: Optional[str] = None):
       log to sys.stderr, specify 'stderr'. To log to a file, specify the file
       path. Specify None to disable logging.
   """
+  final_log_message = ''
+  if apilog is None:
+    try:
+      unique_suffix = GetUniqueSuffix()
+      apilog = os.path.join(
+          os.environ['TEST_UNDECLARED_OUTPUTS_DIR'],
+          f'bq_cli{unique_suffix}.log',
+      )
+      final_log_message = (
+          'No logging set and TEST_UNDECLARED_OUTPUTS_DIR is set so we are'
+          f' in a test environment and will log to file: {apilog}.'
+      )
+    except KeyError:
+      pass  # Not in a test environment.
   if apilog is None:
     # Effectively turn off logging.
     logging.debug(
@@ -39,7 +77,7 @@ def ConfigurePythonLogger(apilog: Optional[str] = None):
     elif apilog == 'stderr':
       _SetLogFile(sys.stderr)
     elif apilog:
-      _SetLogFile(open(apilog, 'w'))
+      _SetLogFile(open(apilog, 'a'))
     else:
       logging.basicConfig(level=logging.INFO)
     # Turn on apiclient logging of http requests and responses. (Here
@@ -49,6 +87,8 @@ def ConfigurePythonLogger(apilog: Optional[str] = None):
       flags.FLAGS.dump_request_response = True
     else:
       model.dump_request_response = True
+  if final_log_message:
+    logging.info(final_log_message)
 
 
 def EncodeForPrinting(o: object) -> str:

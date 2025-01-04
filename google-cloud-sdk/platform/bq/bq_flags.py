@@ -5,8 +5,6 @@ import enum
 import os
 from typing import Optional
 
-
-
 from absl import flags
 
 
@@ -42,6 +40,14 @@ API: flags.FlagHolder[Optional[str]] = flags.DEFINE_string(
     'api',
     'https://bigquery.googleapis.com',
     'API endpoint to talk to.'
+)
+
+flags.register_validator(
+    'api',
+    lambda val: val is None or not (val.startswith("'") or val.startswith('"')),
+    message=(
+        'The parsed api flag value should not still be wrapped with quotes.'
+    ),
 )
 
 UNIVERSE_DOMAIN: flags.FlagHolder[Optional[str]] = flags.DEFINE_string(
@@ -85,6 +91,11 @@ BIGQUERYRC = flags.DEFINE_string(
         ' BIGQUERYRC environment variable is used. If that is not specified,'
         ' the path "~/.bigqueryrc" is used.'
     ),
+)
+BIGQUERY_DISCOVERY_API_KEY_FLAG = flags.DEFINE_string(
+    'bigquery_discovery_api_key',
+    None,
+    'API key to use for discovery doc requests.',
 )
 DISCOVERY_FILE = flags.DEFINE_string(
     'discovery_file',

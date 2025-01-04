@@ -12,9 +12,8 @@ import logging
 import tempfile
 import time
 import traceback
-from typing import Any, Callable, List, Optional, Union
+from typing import Callable, List, Optional, Union
 import urllib
-
 
 # To configure apiclient logging.
 from absl import flags
@@ -24,6 +23,8 @@ import httplib2
 
 import bq_flags
 import bq_utils
+import credential_loader
+from auth import main_credential_loader
 from clients import bigquery_http
 from clients import utils as bq_client_utils
 from clients import wait_printer
@@ -31,6 +32,7 @@ from discovery_documents import discovery_document_cache
 from discovery_documents import discovery_document_loader
 from utils import bq_api_utils
 from utils import bq_error
+from utils import bq_logging
 
 
 try:
@@ -51,12 +53,22 @@ except ImportError:
 # distinguish default from None.
 _DEFAULT = object()
 
+LegacyAndGoogleAuthCredentialsUnionType = Union[
+    main_credential_loader.GoogleAuthCredentialsUnionType,
+    credential_loader.CredentialsFromFlagsUnionType,
+]
+
 Service = bq_api_utils.Service
 
 
 class BigqueryClient:
   """Class encapsulating interaction with the BigQuery service."""
 
+  class JobCreationMode(str, enum.Enum):
+    """Enum of job creation mode."""
+
+    JOB_CREATION_REQUIRED = 'JOB_CREATION_REQUIRED'
+    JOB_CREATION_OPTIONAL = 'JOB_CREATION_OPTIONAL'
 
   def __init__(
       self,
@@ -70,7 +82,7 @@ class BigqueryClient:
       trace: Optional[str] = None,
       sync: bool = True,
       wait_printer_factory: Optional[
-          Callable[[], wait_printer.TransitionWaitPrinter]
+          Callable[[], wait_printer.WaitPrinter]
       ] = wait_printer.TransitionWaitPrinter,
       job_id_generator: bq_client_utils.JobIdGenerator = bq_client_utils.JobIdGeneratorIncrementing(
           bq_client_utils.JobIdGeneratorRandom()
@@ -78,7 +90,7 @@ class BigqueryClient:
       max_rows_per_request: Optional[int] = None,
       quota_project_id: Optional[str] = None,
       use_google_auth: bool = False,
-      credentials=None,
+      credentials: Optional[LegacyAndGoogleAuthCredentialsUnionType] = None,
       enable_resumable_uploads: bool = True,
       **kwds,
   ):
@@ -217,21 +229,15 @@ class BigqueryClient:
 
   def GetAuthorizedHttp(
       self,
-      credentials: Any,
+      credentials: LegacyAndGoogleAuthCredentialsUnionType,
       http: Union[
           'httplib2.Http',
       ],
-      is_for_discovery: bool = False,
   ) -> Union[
       'httplib2.Http',
       'google_auth_httplib2.AuthorizedHttp',
   ]:
     """Returns an http client that is authorized with the given credentials."""
-    if is_for_discovery:
-      # Discovery request shouldn't have any quota project ID set.
-      credentials = bq_utils.GetSanitizedCredentialForDiscoveryRequest(
-          self.use_google_auth, credentials
-      )
 
     if self.use_google_auth:
       if not _HAS_GOOGLE_AUTH:
@@ -258,7 +264,12 @@ class BigqueryClient:
             'google-auth-httplib2.'
         )
       return google_auth_httplib2.AuthorizedHttp(credentials, http=http)
-    return credentials.authorize(http)
+    # Note: This block simplified adding typing and should be removable when
+    # legacy credentials are removed.
+    if hasattr(credentials, 'authorize'):
+      return credentials.authorize(http)
+    else:
+      raise TypeError('Unsupported credential type: {type(credentials)}')
     # LINT.ThenChange(
     #     //depot/google3/cloud/helix/testing/e2e/python_api_client/api_client_lib.py:http_authorization,
     #     //depot/google3/cloud/helix/testing/e2e/python_api_client/api_client_util.py:http_authorization,
@@ -271,10 +282,11 @@ class BigqueryClient:
   ) -> discovery.Resource:
     """Build and return BigQuery Dynamic client from discovery document."""
     logging.info('BuildApiClient discovery_url: %s', discovery_url)
-    http_client = self.GetHttp()
-    http = self.GetAuthorizedHttp(
-        self.credentials, http_client, is_for_discovery=True
-    )
+    # If self.credentials is of type google.auth, it has to be cleared of the
+    # _quota_project_id value later on in this function for discovery requests.
+    # bigquery_model has to be built with the quota project retained, so in this
+    # version of the implementation, it's built before discovery requests take
+    # place.
     bigquery_model = bigquery_http.BigqueryModel(
         trace=self.trace,
         quota_project_id=bq_utils.GetEffectiveQuotaProjectIDForHTTPHeader(
@@ -288,6 +300,15 @@ class BigqueryClient:
         bigquery_model,
         self.use_google_auth,
     )
+    # Clean up quota project ID from Google Auth credentials.
+    # This is specifically needed to construct a http object used for discovery
+    # requests below as quota project ID shouldn't participate in discovery
+    # document retrieval, otherwise the discovery request would result in a
+    # permission error seen in b/321286043.
+    if self.use_google_auth and hasattr(self.credentials, '_quota_project_id'):
+      self.credentials._quota_project_id = None  # pylint: disable=protected-access
+    http_client = self.GetHttp()
+    http = self.GetAuthorizedHttp(self.credentials, http_client)
     discovery_document = None
     if self.discovery_document != _DEFAULT:
       discovery_document = self.discovery_document
@@ -397,14 +418,15 @@ class BigqueryClient:
         discovery_document=discovery_document, service=service
     )
 
+
     built_client = None
     try:
-      # The http object comes from self.GetAuthorizedHttp above with
-      # is_for_discovery=True. This means if the underlying credentials object
-      # is of type google.oauth2, it will not carry a quota project ID
-      # regardless of whether an ID is provided explicitly. This specific http
-      # object has to be used for the discovery requests, and so far has found
-      # to have no effect on BQ API requests in practice.
+      # If the underlying credentials object used for authentication is of type
+      # google.auth, its quota project ID will have been removed earlier in this
+      # function if one was provided explicitly. This specific http object
+      # created from that modified credentials object must be the one used for
+      # the discovery requests, otherwise they would result in a permission
+      # error as seen in b/321286043.
       built_client = discovery.build_from_document(
           discovery_document_to_build_client,
           http=http,
@@ -482,6 +504,11 @@ class BigqueryClient:
       discovery_url = bq_api_utils.get_discovery_url_from_root_url(
           path, api_version='v1'
       )
+      discovery_url = bq_api_utils.add_api_key_to_discovery_url(
+          discovery_url=discovery_url,
+          universe_domain=bq_flags.UNIVERSE_DOMAIN.value,
+          inputted_flags=bq_flags,
+      )
       self._op_transfer_client = self.BuildApiClient(
           discovery_url=discovery_url,
           service=Service.DTS,
@@ -507,6 +534,13 @@ class BigqueryClient:
       discovery_url = bq_api_utils.get_discovery_url_from_root_url(
           path, api_version=reservation_version
       )
+      labels = None
+      discovery_url = bq_api_utils.add_api_key_to_discovery_url(
+          discovery_url=discovery_url,
+          universe_domain=bq_flags.UNIVERSE_DOMAIN.value,
+          inputted_flags=bq_flags,
+          labels=labels,
+      )
       self._op_reservation_client = self.BuildApiClient(
           discovery_url=discovery_url,
           service=Service.RESERVATIONS,
@@ -529,6 +563,11 @@ class BigqueryClient:
       )
       discovery_url = bq_api_utils.get_discovery_url_from_root_url(
           path, api_version='v1'
+      )
+      discovery_url = bq_api_utils.add_api_key_to_discovery_url(
+          discovery_url=discovery_url,
+          universe_domain=bq_flags.UNIVERSE_DOMAIN.value,
+          inputted_flags=bq_flags,
       )
       self._op_connection_service_client = self.BuildApiClient(
           discovery_url=discovery_url,
